@@ -1,7 +1,9 @@
 from dataclasses import dataclass
 from typing import Optional, Any, Dict, List, Tuple
 import io
+import os
 import random
+import numpy as np
 import torch
 import torchaudio
 from PIL import Image
@@ -14,6 +16,7 @@ class OmniAutoProcessorCollator:
     model_args: Any
     training_args: Any
     batch_size: Optional[int] = None
+    _printed_proc_info: bool = False
 
     # ---------- helpers ----------
     def _clean_image_list(self, imgs):
@@ -87,17 +90,22 @@ class OmniAutoProcessorCollator:
         return self._clean_image_list(visual)
 
     def _load_audio_batch(self, audio_items: List[Any]) -> Tuple[List[Optional[torch.Tensor]], int]:
+        # Unified audio config: use same fields as eval
         target_sr = int(getattr(self.data_args, "audio_sample_rate", 16000) or 16000)
         min_audio_samples = getattr(self.data_args, "audio_min_samples", None)
         if min_audio_samples is None:
             min_audio_samples = int(target_sr * 0.025)  # 25ms
 
+        # Unified max audio length: audio_max_seconds takes precedence over audio_max_samples
         max_audio_seconds = getattr(self.data_args, "audio_max_seconds", None)
         if max_audio_seconds is not None:
             max_audio_samples = int(float(max_audio_seconds) * target_sr)
         else:
-            max_audio_frames = int(getattr(self.data_args, "audio_max_frames", 1024))
-            max_audio_samples = max_audio_frames * 160
+            max_audio_samples = getattr(self.data_args, "audio_max_samples", None)
+            if max_audio_samples is None:
+                # Fallback to legacy config for compatibility
+                max_audio_frames = int(getattr(self.data_args, "audio_max_frames", 1024))
+                max_audio_samples = max_audio_frames * 160
 
         out = []
         for item in audio_items:
@@ -211,8 +219,8 @@ class OmniAutoProcessorCollator:
 
         return texts, images, audios
 
-    def _sig(self, img, vid, aud):
-        has_a = aud is not None
+    def _sig(self, img, vid, has_audio: bool):
+        has_a = bool(has_audio)
         has_i = img is not None
         has_v = vid is not None
         return (has_i, has_v, has_a)
@@ -220,24 +228,130 @@ class OmniAutoProcessorCollator:
     def _process_group(self, texts, images, videos, audios, max_length: int):
         kwargs = dict(
             text=texts,
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt",
+            text_kwargs={
+                "padding": "max_length",
+                "truncation": True,
+                "return_tensors": "pt",
+            },
         )
+        if max_length is not None:
+            kwargs["text_kwargs"]["max_length"] = max_length
+
         has_images = any(im is not None for im in images)
         has_videos = any(v is not None for v in videos)
+        has_audios = any(a is not None for a in audios)
+
         if has_images and has_videos:
             raise ValueError("OmniAutoProcessorCollator: cannot mix images and videos in the same group.")
+
         if has_images:
             kwargs["images"] = images
         if has_videos:
             kwargs["videos"] = videos
-        if any(a is not None for a in audios):
-            kwargs["audios"] = audios
-            kwargs["sampling_rate"] = int(getattr(self.data_args, "audio_sample_rate", 16000) or 16000)
+        audio_present = None
+        if has_audios:
+            # Build per-sample audio list, keep batch aligned; missing audio -> dummy zeros.
+            audio_present = []
+            audio_np = []
+            audio_invalid = False
+            dummy_len = 1
+            for a in audios:
+                if isinstance(a, torch.Tensor) and a.numel() > 0:
+                    if a.dim() > 1:
+                        a = a.squeeze()
+                    if a.dim() == 1:
+                        audio_present.append(True)
+                        audio_np.append(a.detach().cpu().numpy().astype(np.float32, copy=False))
+                        continue
+                    if os.environ.get("VLM2VEC_DEBUG"):
+                        print(f"[DEBUG] Invalid audio tensor shape: {a.shape}")
+                    audio_invalid = True
+                    break
+                elif a is None:
+                    audio_present.append(False)
+                    audio_np.append(np.zeros((dummy_len,), dtype=np.float32))
+                else:
+                    if os.environ.get("VLM2VEC_DEBUG"):
+                        print(f"[DEBUG] Invalid audio tensor: {type(a)}")
+                    audio_invalid = True
+                    break
+            if not audio_invalid and len(audio_np) == len(texts):
+                kwargs["audio"] = audio_np
+                target_sr = int(getattr(self.data_args, "audio_sample_rate", 16000) or 16000)
+                kwargs["audio_kwargs"] = {"sampling_rate": target_sr}
+                if os.environ.get("VLM2VEC_DEBUG"):
+                    print(f"[DEBUG] Passing {len(audio_np)} audios to processor (dummy for missing)")
+            else:
+                if os.environ.get("VLM2VEC_DEBUG"):
+                    print("[DEBUG] Audio invalid or count mismatch, skipping audio processing")
+                has_audios = False
 
-        return self.processor(**kwargs)
+        # Audio parameters are only passed when has_audios is True and all audios are valid
+        if "audio" in kwargs:
+            assert isinstance(kwargs["audio"], list)
+            assert len(kwargs["audio"]) == len(kwargs["text"])
+            assert all(isinstance(a, np.ndarray) and a.ndim == 1 for a in kwargs["audio"])
+            assert all(a.dtype in (np.float32, np.float64) for a in kwargs["audio"])
+
+        base_processor = getattr(self.processor, "base", self.processor)
+        if not self._printed_proc_info and os.environ.get("VLM2VEC_DEBUG"):
+            print("PROC TYPE:", type(base_processor))
+            print("KWARGS KEYS:", sorted(list(kwargs.keys())))
+            for attr in ["tokenizer", "image_processor", "feature_extractor", "audio_processor", "base"]:
+                print(attr, hasattr(base_processor, attr))
+            self._printed_proc_info = True
+        outputs = base_processor(**kwargs)
+
+        # If we injected dummy audio, zero out features & masks for missing samples.
+        if audio_present is not None and "input_features" in outputs:
+            missing = torch.tensor([not x for x in audio_present], dtype=torch.bool)
+            if missing.any():
+                if isinstance(outputs.get("input_features"), torch.Tensor):
+                    outputs["input_features"][missing] = 0
+                if isinstance(outputs.get("feature_attention_mask"), torch.Tensor):
+                    outputs["feature_attention_mask"][missing] = 0
+        return outputs
+
+    def _tensor_only(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        return {k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}
+
+    def _should_use_chat_template(self) -> bool:
+        try:
+            from src.model.processor import QWEN2_5_OMNI, NVOMNIEMBED
+        except Exception:
+            return False
+        backbone = getattr(self.model_args, "model_backbone", None)
+        if backbone not in {QWEN2_5_OMNI, NVOMNIEMBED}:
+            return False
+        # Only enable if processor exposes apply_chat_template
+        if hasattr(self.processor, "apply_chat_template"):
+            return True
+        if hasattr(self.processor, "tokenizer") and hasattr(self.processor.tokenizer, "apply_chat_template"):
+            return True
+        return False
+
+    def _process_group_chat_template(self, texts, images, videos, audios, max_length: int):
+        """
+        Align with Nemotron eval: apply_chat_template + process_mm_info.
+        Uses NVOmni_process_fn which wraps both behaviors.
+        """
+        from src.model.processor import NVOmni_process_fn
+
+        inputs = {"text": texts}
+        if images is not None and any(im is not None for im in images):
+            inputs["images"] = images
+        if videos is not None and any(v is not None for v in videos):
+            inputs["videos"] = videos
+        if audios is not None and any(a is not None for a in audios):
+            inputs["audios"] = audios
+            inputs["audio_sample_rate"] = int(getattr(self.data_args, "audio_sample_rate", 16000) or 16000)
+
+        outputs = NVOmni_process_fn(
+            model_inputs=inputs,
+            processor=self.processor,
+            max_length=max_length,
+        )
+        return self._tensor_only(outputs)
 
     # ---------- main ----------
     def __call__(self, examples: List[dict]):
@@ -252,6 +366,9 @@ class OmniAutoProcessorCollator:
         # decode audio tensors only for those that exist (avoid dummy audio)
         q_wavs, q_sr = self._load_audio_batch(q_auds)
         p_wavs, p_sr = self._load_audio_batch(p_auds)
+        if os.environ.get("VLM2VEC_DEBUG"):
+            print(f"[DEBUG] q_audio batch len={len(q_wavs)} shapes/numel={[None if w is None else (tuple(w.shape), int(w.numel())) for w in q_wavs]}")
+            print(f"[DEBUG] p_audio batch len={len(p_wavs)} shapes/numel={[None if w is None else (tuple(w.shape), int(w.numel())) for w in p_wavs]}")
 
         q_imgs, q_vids = [], []
         p_imgs, p_vids = [], []
@@ -282,31 +399,80 @@ class OmniAutoProcessorCollator:
                 q_wavs[i], p_wavs[i] = None, None
 
         # group by modality signature to keep processor assumptions clean
+        # Re-group after invalid sample replacement to ensure consistent signatures
         idxs = list(range(len(examples)))
         groups = {}
         for i in idxs:
-            s = (
-                self._sig(q_imgs[i], q_vids[i], q_wavs[i]),
-                self._sig(p_imgs[i], p_vids[i], p_wavs[i]),
-            )
+            # Only consider samples with valid modalities; group by has_audio to avoid mixed audio in-group
+            q_has_audio = q_wavs[i] is not None
+            p_has_audio = p_wavs[i] is not None
+            q_sig = self._sig(q_imgs[i], q_vids[i], q_has_audio)
+            p_sig = self._sig(p_imgs[i], p_vids[i], p_has_audio)
+            s = (q_sig, p_sig)
             groups.setdefault(s, []).append(i)
 
         max_len = int(getattr(self.data_args, "max_len", 256))
+        use_chat_template = self._should_use_chat_template()
+        if use_chat_template and not getattr(self, "_printed_chat_template_info", False):
+            print("[INFO] OmniAutoProcessorCollator: using apply_chat_template + process_mm_info (Nemotron-style)")
+            self._printed_chat_template_info = True
 
         def _merge(out_list: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
             # out_list already per-group; we need reconstruct per-example order.
             # We'll build dict of lists then stack/pad is already done by processor.
+            # Ensure missing batch-first keys are filled so batch dims align.
+            batch_first_keys = {
+                "input_ids",
+                "attention_mask",
+                "token_type_ids",
+                "position_ids",
+                "input_features",
+                "feature_attention_mask",
+                "audio_feature_lengths",
+                "labels",
+            }
+            key_refs = {}
+            for out in out_list:
+                for k, v in out.items():
+                    if k in batch_first_keys and isinstance(v, torch.Tensor):
+                        key_refs.setdefault(k, v)
+            if key_refs:
+                for out in out_list:
+                    # infer batch size from any tensor in this out
+                    bsz = None
+                    for v in out.values():
+                        if isinstance(v, torch.Tensor):
+                            bsz = v.shape[0]
+                            break
+                    if bsz is None:
+                        continue
+                    for k, ref in key_refs.items():
+                        if k not in out:
+                            out[k] = torch.zeros(
+                                (bsz, *ref.shape[1:]),
+                                device=ref.device,
+                                dtype=ref.dtype,
+                            )
             merged = {}
             for out in out_list:
                 for k, v in out.items():
                     merged.setdefault(k, []).append(v)
             # concatenate along batch dim
             final = {}
+            debug_merge = os.environ.get("VLM2VEC_DEBUG_MERGE_SHAPES", "").lower()
             for k, chunks in merged.items():
                 if isinstance(chunks[0], torch.Tensor):
+                    if debug_merge:
+                        shapes = [tuple(c.shape) for c in chunks]
+                        if len(set(shapes)) != 1:
+                            print(f"[DEBUG][merge] key={k} shapes={shapes}")
                     final[k] = torch.cat(chunks, dim=0)
                 else:
                     # e.g. lists (rare from processor), keep concatenation
+                    if debug_merge:
+                        lens = [len(c) for c in chunks]
+                        if len(set(lens)) != 1:
+                            print(f"[DEBUG][merge] key={k} lens={lens}")
                     tmp = []
                     for c in chunks:
                         tmp.extend(c)
@@ -330,8 +496,12 @@ class OmniAutoProcessorCollator:
             sub_p_vid  = [p_vids[i] for i in sub]
             sub_p_wav  = [p_wavs[i] for i in sub]
 
-            q_proc = self._process_group(sub_q_text, sub_q_img, sub_q_vid, sub_q_wav, max_len)
-            p_proc = self._process_group(sub_p_text, sub_p_img, sub_p_vid, sub_p_wav, max_len)
+            if use_chat_template:
+                q_proc = self._process_group_chat_template(sub_q_text, sub_q_img, sub_q_vid, sub_q_wav, max_len)
+                p_proc = self._process_group_chat_template(sub_p_text, sub_p_img, sub_p_vid, sub_p_wav, max_len)
+            else:
+                q_proc = self._process_group(sub_q_text, sub_q_img, sub_q_vid, sub_q_wav, max_len)
+                p_proc = self._process_group(sub_p_text, sub_p_img, sub_p_vid, sub_p_wav, max_len)
 
             qry_outs.append(q_proc)
             pos_outs.append(p_proc)
