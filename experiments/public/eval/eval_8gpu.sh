@@ -13,7 +13,7 @@ cd "$REPO_ROOT" || exit 1
 # ==============================================================================
 # Configuration
 # ==============================================================================
-CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+CUDA_VISIBLE_DEVICES="4,5,6,7"
 BATCH_SIZE=8
 MODALITIES=("image" "video" "tool" "visdoc" "audio" "text")
 DATA_BASEDIR=/data/mengrui/.cache/huggingface/datasets/MMEB-V3
