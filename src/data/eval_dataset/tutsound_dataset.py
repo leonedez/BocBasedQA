@@ -134,6 +134,14 @@ def build_tutsound_audio_dataset(path_info: Tuple[str, str, str], **kwargs):
             })
         gt_events = normalized_events
         gt_segments = [(float(ev["onset"]), float(ev["offset"])) for ev in gt_events]
+        # Relaxed positives: within the same file, any segment with the same label is considered correct.
+        label_to_seg_ids: Dict[str, List[str]] = {}
+        for ev in gt_events:
+            seg_id = _seg_id(fp, float(ev["onset"]), float(ev["offset"]))
+            label_to_seg_ids.setdefault(ev["label"], []).append(seg_id)
+        for k in list(label_to_seg_ids.keys()):
+            # Keep deterministic order while removing accidental duplicates.
+            label_to_seg_ids[k] = list(dict.fromkeys(label_to_seg_ids[k]))
 
         # 背景滑窗候选（固定长度，最后一窗不满则丢弃）
         neg_segments = []
@@ -170,6 +178,8 @@ def build_tutsound_audio_dataset(path_info: Tuple[str, str, str], **kwargs):
             cand_image.append(cand_image_row)
             cand_audio.append(cand_audio_row)
 
+            primary_seg_id = _seg_id(fp, float(ev["onset"]), float(ev["offset"]))
+            positive_seg_ids = label_to_seg_ids.get(ev["label"], [primary_seg_id])
             dataset_infos.append(
                 {
                     "file_path": fp,
@@ -177,7 +187,9 @@ def build_tutsound_audio_dataset(path_info: Tuple[str, str, str], **kwargs):
                     "gt_events": gt_events,
                     "query_event": ev,
                     "cand_names": cand_names,
-                    "label_name": _seg_id(fp, float(ev["onset"]), float(ev["offset"])),
+                    # Relaxed criterion: same file + same label + any matched segment counts as correct.
+                    "label_name": list(positive_seg_ids),
+                    "primary_label_name": primary_seg_id,
                 }
             )
 
